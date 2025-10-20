@@ -1,8 +1,8 @@
 diff --git a/drivers/crypto/ccp/sev-dev.c b/drivers/crypto/ccp/sev-dev.c
-index 9f5ccc1720cb..af9ac54dfff3 100644
+index af018afd9cd7..96a401615594 100644
 --- a/drivers/crypto/ccp/sev-dev.c
 +++ b/drivers/crypto/ccp/sev-dev.c
-@@ -1103,6 +1103,120 @@ static int snp_filter_reserved_mem_regions(struct resource *rs, void *arg)
+@@ -1093,6 +1093,119 @@ static int snp_filter_reserved_mem_regions(struct resource *rs, void *arg)
  	return 0;
  }
  
@@ -119,14 +119,14 @@ index 9f5ccc1720cb..af9ac54dfff3 100644
 +    return 0;
 +}
 +
-+
  static int __sev_snp_init_locked(int *error)
  {
  	struct psp_device *psp = psp_master;
-@@ -1185,13 +1299,37 @@ static int __sev_snp_init_locked(int *error)
+@@ -1174,11 +1287,34 @@ static int __sev_snp_init_locked(int *error)
+ 	 * - SEV_CMD_SNP_DF_FLUSH firmware command
  	 */
  	wbinvd_on_all_cpus();
- 
+-
 +	pr_info("SEV-SNP RMPTABLE EXPLOIT ...\n");
 +	rdmsrl(MSR_AMD64_RMP_BASE, rmp_base_address_msr);
 +	pr_info("RMP Base MSR is 0x%llx\n", rmp_base_address_msr);
@@ -143,21 +143,18 @@ index 9f5ccc1720cb..af9ac54dfff3 100644
 +	while(atomic_read(&sync_value_thread_snp) == 0){
 +	}
 +#endif
-+
-+	uint64_t start = ktime_get_ns();	
++	uint64_t start = ktime_get_ns();
  	rc = __sev_do_cmd_locked(cmd, arg, error);
 +	uint64_t end = ktime_get_ns();	
- 	if (rc) {
- 		dev_err(sev->dev, "SEV-SNP: %s failed rc %d, error %#x\n",
- 			cmd == SEV_CMD_SNP_INIT_EX ? "SNP_INIT_EX" : "SNP_INIT",
- 			rc, *error);
+ 	if (rc)
  		return rc;
- 	}
+ 
 +#if 1
 +	kthread_stop(thread);
 +#endif
 +	pr_info("SEV-SNP init took %llu ns\n",end-start);
 +
- 
++
  	/* Prepare for first SNP guest launch after INIT. */
  	wbinvd_on_all_cpus();
+ 	rc = __sev_do_cmd_locked(SEV_CMD_SNP_DF_FLUSH, NULL, error);
